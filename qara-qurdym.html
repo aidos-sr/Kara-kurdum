@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="kk">
+<head>
+<meta charset="UTF-8">
+<title>Қара Құрдым — Жерді Жұту</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; }
+  canvas { display:block; }
+  #ui {
+    position:fixed; top:0; left:0; width:100%; height:100%;
+    pointer-events:none; z-index:10;
+    font-family:'Courier New', monospace;
+  }
+  #title {
+    position:absolute; top:22px; left:50%; transform:translateX(-50%);
+    font-size:15px; letter-spacing:8px; color:#cc4400;
+    text-shadow:0 0 18px #cc440088; text-transform:uppercase;
+  }
+  #phase {
+    position:absolute; bottom:28px; left:50%; transform:translateX(-50%);
+    font-size:11px; letter-spacing:5px; color:#553322;
+    transition: color 0.8s, text-shadow 0.8s;
+  }
+  #btn {
+    position:absolute; bottom:22px; right:30px;
+    background:transparent; border:1px solid #552200;
+    color:#552200; padding:8px 22px; font-size:10px;
+    letter-spacing:3px; cursor:pointer; pointer-events:all;
+    font-family:'Courier New', monospace; transition:all 0.3s;
+  }
+  #btn:hover { border-color:#cc4400; color:#cc4400; box-shadow:0 0 14px #cc440055; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="title">ҚАРА ҚҰРДЫМ</div>
+  <div id="phase">ПАЙДА БОЛУДА...</div>
+  <button id="btn" onclick="restart()">↺ ҚАЙТА</button>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+const phaseEl = document.getElementById('phase');
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+resize();
+window.addEventListener('resize', resize);
+
+const VS = `
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+`;
+
+const FS = `
+precision highp float;
+uniform vec2  u_res;
+uniform float u_time;
+uniform float u_bhScale;
+uniform float u_earthScale;
+uniform float u_earthX;
+uniform float u_swallow;
+uniform float u_appear;
+
+#define PI 3.14159265358979
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p); vec2 f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  return mix(
+    mix(hash(i), hash(i+vec2(1,0)), f.x),
+    mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+}
+
+float diskBright(float r, float rInner, float rOuter, float angle, float t) {
+  if (r < rInner || r > rOuter) return 0.0;
+  float norm = (r - rInner) / (rOuter - rInner);
+  float radial = pow(1.0 - norm, 1.6) * pow(norm + 0.04, 0.25);
+  float stripes = 0.55 + 0.45 * sin(norm * 42.0 - t * 0.5);
+  float omega   = 0.55 / pow(r, 1.5);
+  float doppler = 1.0 + 0.65 * sin(angle - omega * t);
+  doppler = max(0.15, doppler);
+  return radial * stripes * doppler * 2.0;
+}
+
+vec3 diskColor(float r, float rInner, float rOuter, float bright) {
+  float n = clamp((r - rInner) / (rOuter - rInner), 0.0, 1.0);
+  vec3 c;
+  if (n < 0.30) c = mix(vec3(1.00,0.88,0.58), vec3(0.95,0.30,0.05), n/0.30);
+  else          c = mix(vec3(0.95,0.30,0.05), vec3(0.38,0.04,0.01), (n-0.30)/0.70);
+  c *= bright;
+  c  = c / (c + 0.75);
+  c  = pow(c, vec3(0.72));
+  return c;
+}
+
+vec3 earthTex(vec2 uv) {
+  vec3 ocean = vec3(0.08, 0.28, 0.55);
+  float n1 = noise(uv * 3.2 + vec2(1.3, 0.7));
+  float n2 = noise(uv * 6.1 + vec2(0.4, 2.1));
+  float land = smoothstep(0.48, 0.56, n1 * 0.6 + n2 * 0.4);
+  vec3 green = vec3(0.15, 0.42, 0.12);
+  vec3 sand  = vec3(0.55, 0.45, 0.25);
+  vec3 landCol = mix(green, sand, noise(uv * 8.0));
+  float pole = smoothstep(0.6, 0.85, abs(uv.y - 0.5) * 2.0);
+  vec3 ice = vec3(0.85, 0.92, 0.98);
+  vec3 base = mix(ocean, landCol, land);
+  base = mix(base, ice, pole);
+  float cloud = smoothstep(0.55, 0.72, noise(uv * 4.5 + vec2(0.2, 0.8)));
+  base = mix(base, vec3(0.88,0.90,0.94), cloud * 0.55);
+  return base;
+}
+
+vec3 drawEarth(vec2 uv, vec2 center, float radius, float t, float swallow) {
+  vec2 d = uv - center;
+  float dist = length(d);
+  if (dist > radius) return vec3(-1.0);
+
+  float z = sqrt(max(0.0, 1.0 - (d.x*d.x + d.y*d.y) / (radius*radius)));
+  vec3 norm = normalize(vec3(d / radius, z));
+
+  vec2 sUV;
+  sUV.x = 0.5 + atan(norm.z, norm.x) / (2.0 * PI) + t * 0.04;
+  sUV.y = 0.5 - asin(clamp(norm.y, -1.0, 1.0)) / PI;
+
+  vec3 col = earthTex(sUV);
+
+  vec3 lightDir = normalize(vec3(-1.0, 0.2, 0.5));
+  float diff = max(0.0, dot(norm, lightDir));
+  col *= (0.25 + 0.75 * diff);
+
+  float rim = 1.0 - z;
+  col += vec3(0.15, 0.35, 0.7) * pow(rim, 3.0) * 0.6;
+
+  col = mix(col, vec3(1.0, 0.3, 0.0), swallow * swallow * 0.85);
+  col = mix(col, vec3(0.0), pow(swallow, 3.0) * 0.7);
+
+  return col;
+}
+
+vec2 tidalDistort(vec2 uv, vec2 bhCenter, vec2 earthCenter, float swallow) {
+  if (swallow < 0.01) return uv;
+  vec2 toEarth = earthCenter - bhCenter;
+  vec2 axis = normalize(toEarth);
+  vec2 perp  = vec2(-axis.y, axis.x);
+  vec2 delta = uv - earthCenter;
+  float stretch  = 1.0 + swallow * swallow * 2.5;
+  float squish   = 1.0 / (1.0 + swallow * 0.8);
+  float dAlong   = dot(delta, axis);
+  float dPerp    = dot(delta, perp);
+  return earthCenter + axis * dAlong / stretch + perp * dPerp / squish;
+}
+
+void main() {
+  vec2 fragUV = gl_FragCoord.xy / u_res;
+  float aspect = u_res.x / u_res.y;
+
+  vec2 uv = (gl_FragCoord.xy - u_res * 0.5) / min(u_res.x, u_res.y);
+
+  float t = u_time;
+
+  vec2 bhPos    = vec2(0.0, 0.0);
+  float bhR     = 0.12 * u_bhScale * u_appear;
+  float dInner  = bhR * 1.12;
+  float dOuter  = bhR * 4.2;
+
+  float earthStartX = 0.42;
+  float earthCurX   = mix(earthStartX, bhR * 1.3, u_swallow * u_swallow);
+  vec2  earthPos    = vec2(earthCurX, 0.0);
+  float earthR      = 0.10 * u_earthScale * u_appear;
+
+  vec3 color = vec3(0.0);
+  {
+    vec2 st = uv * 22.0;
+    vec2 id = floor(st);
+    vec2 fr = fract(st);
+    float h1 = hash(id);
+    float h2 = hash(id + vec2(13.7, 5.3));
+    float h3 = hash(id + vec2(7.1, 19.4));
+    vec2 sp  = vec2(h1, h2);
+    float sd = length(fr - sp);
+    float star = smoothstep(0.045, 0.0, sd) * h3;
+    float bhDist = length(uv - bhPos);
+    star *= smoothstep(dOuter * 0.5, dOuter * 1.5, bhDist);
+    color += vec3(star * 0.6, star * 0.7, star);
+  }
+
+  float dist = length(uv - bhPos);
+
+  vec2 lensed = uv;
+  if (dist > bhR && u_appear > 0.05) {
+    float lf = 0.28 * bhR / (dist * dist);
+    lf = min(lf, 1.2);
+    lensed = uv - (uv - bhPos) * lf;
+  }
+  float lDist  = length(lensed - bhPos);
+  float lAngle = atan((lensed - bhPos).y, (lensed - bhPos).x);
+
+  if (u_appear > 0.05) {
+    float br = diskBright(lDist, dInner, dOuter, lAngle, t);
+    if (br > 0.0) {
+      float planeProx = exp(-abs((lensed - bhPos).y) * 16.0);
+      float lw = smoothstep(bhR * 0.9, bhR * 2.5, dist);
+      float combined = br * planeProx * lw * 1.3 * u_appear;
+      color += diskColor(lDist, dInner, dOuter, combined);
+    }
+  }
+
+  if (u_appear > 0.05) {
+    vec2 dUV   = uv - bhPos;
+    float r    = length(vec2(dUV.x, 0.0));
+    float thick= 0.018 + 0.008*(1.0 - smoothstep(dInner, dOuter, r));
+    float strip= exp(-dUV.y * dUV.y / (thick * thick));
+    float br   = diskBright(r, dInner, dOuter, (dUV.x>0.0?0.0:PI), t);
+    float front= (dUV.y < 0.0) ? 1.0 : 0.5;
+    float vis  = smoothstep(bhR*0.85, bhR, dist);
+    float combined = br * strip * 1.7 * front * vis * u_appear;
+    color += diskColor(r, dInner, dOuter, combined);
+  }
+
+  if (u_appear > 0.05) {
+    float ring = smoothstep(bhR*0.88, bhR*1.0, dist)
+               * smoothstep(bhR*1.28, bhR*1.04, dist);
+    float dop  = 1.0 + 0.5*sin(atan((uv-bhPos).y,(uv-bhPos).x) - t*0.9);
+    color += vec3(1.0,0.55,0.15) * ring * dop * 2.5 * u_appear;
+  }
+
+  if (dist < bhR && u_appear > 0.05) {
+    color = vec3(0.0);
+  }
+
+  if (u_appear > 0.05) {
+    float glow = exp(-dist * 6.5) * 0.14 * u_appear;
+    color += vec3(0.55, 0.08, 0.01) * glow;
+  }
+
+  if (u_earthScale > 0.01 && u_appear > 0.1) {
+    vec2 distUV = tidalDistort(uv, bhPos, earthPos, u_swallow);
+    vec3 ec = drawEarth(distUV, earthPos, earthR, t, u_swallow);
+    if (ec.r >= 0.0) {
+      float earthDist = length(uv - earthPos);
+      float rim = smoothstep(earthR, earthR * 1.18, earthDist)
+                * smoothstep(earthR * 1.35, earthR * 1.18, earthDist);
+      color = mix(color, ec, 1.0);
+      color += vec3(0.2, 0.45, 0.85) * rim * 0.5 * (1.0 - u_swallow);
+    }
+  }
+
+  if (u_swallow > 0.6) {
+    float flash = (u_swallow - 0.6) / 0.4;
+    float fd    = length(uv - earthPos);
+    float fr    = exp(-fd * fd / (earthR * earthR * 4.0));
+    color += vec3(1.0, 0.4, 0.1) * fr * flash * 1.5;
+  }
+
+  float vig = 1.0 - dot(fragUV - 0.5, fragUV - 0.5) * 1.4;
+  color *= max(0.0, vig);
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, mkShader(gl.VERTEX_SHADER,   VS));
+gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1,-1, 1,-1, -1,1,  1,-1, 1,1, -1,1
+]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uRes        = gl.getUniformLocation(prog, 'u_res');
+const uTime       = gl.getUniformLocation(prog, 'u_time');
+const uBhScale    = gl.getUniformLocation(prog, 'u_bhScale');
+const uEarthScale = gl.getUniformLocation(prog, 'u_earthScale');
+const uEarthX     = gl.getUniformLocation(prog, 'u_earthX');
+const uSwallow    = gl.getUniformLocation(prog, 'u_swallow');
+const uAppear     = gl.getUniformLocation(prog, 'u_appear');
+
+let startTime = null;
+let phase = 0;
+
+const PHASES = [
+  { dur: 2.5, label: 'ПАЙДА БОЛУДА...',  color: '#553322' },
+  { dur: 5.0, label: 'ТАРТЫЛУДА...',     color: '#884400' },
+  { dur: 4.0, label: 'ЖҰТЫЛУДА...',      color: '#cc2200' },
+  { dur: 99,  label: 'ЖОЙЫЛДЫ',          color: '#440000' },
+];
+
+function eio(t) { return t*t*(3-2*t); }
+function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
+
+function restart() {
+  startTime = null; phase = 0;
+  phaseEl.textContent = PHASES[0].label;
+  phaseEl.style.color = PHASES[0].color;
+}
+
+function getUniforms(ts) {
+  if (!startTime) startTime = ts;
+  const elapsed = (ts - startTime) / 1000;
+
+  let phaseTime = elapsed;
+  let p = 0;
+  for (let i = 0; i < PHASES.length - 1; i++) {
+    if (phaseTime < PHASES[i].dur) { p = i; break; }
+    phaseTime -= PHASES[i].dur;
+    p = i + 1;
+  }
+  if (p !== phase) {
+    phase = p;
+    phaseEl.textContent = PHASES[phase].label;
+    phaseEl.style.color = PHASES[phase].color;
+    phaseEl.style.textShadow = phase >= 2 ? '0 0 12px ' + PHASES[phase].color : 'none';
+  }
+
+  let appear = clamp(elapsed / PHASES[0].dur, 0, 1);
+  appear = eio(appear);
+
+  let bhScale = appear;
+
+  let swallow = 0;
+  if (elapsed > PHASES[0].dur) {
+    const sw1 = clamp((elapsed - PHASES[0].dur) / PHASES[1].dur, 0, 1);
+    const sw2t = elapsed - PHASES[0].dur - PHASES[1].dur;
+    const sw2 = sw2t > 0 ? clamp(sw2t / PHASES[2].dur, 0, 1) : 0;
+    swallow = sw1 * 0.35 + sw2 * 0.65;
+    swallow = eio(swallow);
+  }
+
+  const earthScale = Math.max(1.0 - swallow * 1.05, 0.0);
+
+  return { appear, bhScale, swallow, earthScale };
+}
+
+function render(ts) {
+  requestAnimationFrame(render);
+  const { appear, bhScale, swallow, earthScale } = getUniforms(ts);
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime,       ts * 0.001);
+  gl.uniform1f(uAppear,     appear);
+  gl.uniform1f(uBhScale,    bhScale);
+  gl.uniform1f(uEarthScale, earthScale);
+  gl.uniform1f(uSwallow,    swallow);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
